@@ -87,6 +87,92 @@
             text-align: center;
             background-color: #f8f9fa;
         }
+        
+        .setting {
+            display: flex;
+            align-items: center;
+            margin: 10px 0;
+            padding: 8px;
+            background-color: #f8f9fa;
+            border-radius: 8px;
+        }
+        
+        .setting label {
+            flex-grow: 1;
+        }
+        
+        .setting input[type="checkbox"] {
+            width: 20px;
+            height: 20px;
+        }
+        
+        #sessions-container {
+            margin-top: 20px;
+            padding: 10px;
+            background-color: #f8f9fa;
+            border-radius: 8px;
+        }
+
+        #sessions-container h2 {
+            font-size: 20px;
+            margin-bottom: 10px;
+        }
+
+        .session-item {
+            display: flex;
+            flex-direction: column;
+            margin-bottom: 20px;
+            background-color: white;
+            border-radius: 8px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+            overflow: hidden;
+        }
+
+        .session-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 12px;
+            background-color: #f0f0f0;
+            border-bottom: 1px solid #e0e0e0;
+        }
+
+        .session-name {
+            font-weight: 500;
+            display: flex;
+            align-items: center;
+        }
+
+        .session-graph {
+            width: 100%;
+            height: 260px; /* Shorter than main graph */
+        }
+
+        .color-indicator {
+            display: inline-block;
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            margin-right: 8px;
+        }
+
+        .session-actions {
+            display: flex;
+        }
+
+        .session-delete-btn {
+            background-color: #f44336;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            padding: 6px 12px;
+            cursor: pointer;
+            font-size: 14px;
+        }
+
+        .session-delete-btn:hover {
+            background-color: #d32f2f;
+        }
     </style>
 </head>
 <body>
@@ -98,7 +184,20 @@
         <button id="stopButton" disabled>Stop Recording</button>
         <button id="exportButton" disabled>Export Graph</button>
         <div id="batteryStatus">Battery: N/A</div>
+        <div class="setting">
+            <label for="autoReconnect">Auto-reconnect when disconnected</label>
+            <input type="checkbox" id="autoReconnect" checked>
+        </div>
+        <div class="setting">
+            <label for="autoConnect">Auto-connect on page load</label>
+            <input type="checkbox" id="autoConnect">
+        </div>
         <div id="graph"></div>
+        <div id="sessions-container">
+            <h2>Saved Sessions</h2>
+            <div id="sessions-list"></div>
+            <button id="clearSessionsButton">Clear All Sessions</button>
+        </div>
     </div>
     <script>
         let device = null;
@@ -107,12 +206,125 @@
         let batteryCharacteristic = null;
         let isRecording = false;
         let graphData = [];
+        let sessions = []; // Array to store multiple recording sessions
         let graphLayout = {
             title: 'Acceleration Data',
             xaxis: { title: 'Time (s)' },
-            yaxis: { title: 'Velocity (m/s)' }
+            yaxis: { title: 'Velocity (m/s)' },
+            legend: { orientation: 'h', y: -0.2 }
         };
         const MAX_DATA_POINTS = 1000;
+        let reconnectAttempts = 0;
+        let reconnectTimer = null;
+        
+        const isPageReload = true;
+        let manuallyConnected = false;
+
+        document.getElementById('autoReconnect').checked = localStorage.getItem('autoReconnect') !== 'false';
+        document.getElementById('autoConnect').checked = localStorage.getItem('autoConnect') === 'true';
+        
+        document.getElementById('autoReconnect').addEventListener('change', function() {
+            localStorage.setItem('autoReconnect', this.checked);
+        });
+        
+        document.getElementById('autoConnect').addEventListener('change', function() {
+            localStorage.setItem('autoConnect', this.checked);
+        });
+
+        if (sessionStorage.getItem('browserSessionActive')) {
+            console.log("Continuing existing session");
+        } else {
+            console.log("New page load detected");
+            sessionStorage.setItem('browserSessionActive', 'true');
+        }
+
+        document.addEventListener('DOMContentLoaded', function() {
+            if (document.getElementById('autoConnect').checked && !isPageReload) {
+                console.log("Auto-connect enabled, attempting to connect...");
+                tryAutoConnect();
+            } else {
+                console.log("Auto-connect skipped:", 
+                    document.getElementById('autoConnect').checked ? 
+                    "Page was reloaded" : "Auto-connect is disabled");
+            }
+            updateSessionsList();
+        });
+
+        async function tryAutoConnect() {
+            const deviceId = localStorage.getItem('lastConnectedDeviceId');
+            if (!deviceId) {
+                console.log("No previously connected device found");
+                return;
+            }
+            
+            try {
+                console.log("Attempting to auto-connect to last device...");
+                const devices = await navigator.bluetooth.getDevices();
+                const lastDevice = devices.find(d => d.id === deviceId);
+                
+                if (lastDevice) {
+                    updateStatus('Reconnecting...', 'disconnected');
+                    const success = await connectToDeviceById(lastDevice);
+                    if (success) {
+                        console.log("Auto-connect successful, UI updated");
+                    }
+                }
+            } catch (error) {
+                console.error("Auto-connect failed:", error);
+                updateStatus('Auto-connect failed', 'disconnected');
+            }
+        }
+
+        async function connectToDeviceById(knownDevice) {
+            console.log("Connecting to known device:", knownDevice.name);
+            try {
+                device = knownDevice;
+                const server = await device.gatt.connect();
+                console.log("GATT server connected");
+                
+                const service = await server.getPrimaryService(0xFFE0);
+                console.log("Service found:", service.uuid);
+                commandCharacteristic = await service.getCharacteristic(0xFFE2);
+                console.log("Command characteristic found");
+                dataCharacteristic = await service.getCharacteristic(0xFFE3);
+                console.log("Data characteristic found");
+
+                try {
+                    const batteryService = await server.getPrimaryService(0x180F);
+                    batteryCharacteristic = await batteryService.getCharacteristic(0x2A19);
+                    console.log("Battery characteristic found");
+                    
+                    updateBatteryStatus();
+                    
+                    await batteryCharacteristic.startNotifications();
+                    batteryCharacteristic.addEventListener('characteristicvaluechanged', (event) => {
+                        const batteryLevel = event.target.value.getUint8(0);
+                        document.getElementById('batteryStatus').textContent = `Battery: ${batteryLevel}%`;
+                        console.log("Battery level updated:", batteryLevel, "%");
+                    });
+                } catch (error) {
+                    console.info("Battery monitoring is not supported by this device.");
+                    document.getElementById('batteryStatus').textContent = 'Battery: N/A';
+                }
+
+                device.addEventListener('gattserverdisconnected', handleDisconnect);
+                
+                localStorage.setItem('lastConnectedDeviceId', device.id);
+                reconnectAttempts = 0;
+                
+                await receiveDeviceStatus();
+                updateStatus('Connected', 'connected');
+                
+                document.getElementById('connectButton').disabled = false;
+                document.getElementById('exportButton').disabled = false;
+                
+                return true;
+            } catch (error) {
+                console.error("Reconnection failed:", error);
+                updateStatus('Reconnection failed', 'disconnected');
+                return false;
+            }
+        }
 
         async function connectToDevice() {
             console.log("Attempting to connect to device...");
@@ -121,6 +333,9 @@
                     filters: [{ namePrefix: 'IMU' }],
                     optionalServices: [0xFFE0, 0x180F]
                 });
+                
+                manuallyConnected = true;
+                
                 console.log("Device selected:", device.name);
                 const server = await device.gatt.connect();
                 console.log("GATT server connected");
@@ -150,6 +365,9 @@
                 }
 
                 device.addEventListener('gattserverdisconnected', handleDisconnect);
+                
+                localStorage.setItem('lastConnectedDeviceId', device.id);
+                reconnectAttempts = 0;
 
                 await receiveDeviceStatus();
 
@@ -187,6 +405,7 @@
                 }
             } catch (error) {
                 console.error("Failed to receive device status:", error);
+                console.warn("Keeping current UI state due to error reading device status");
             }
         }
 
@@ -231,6 +450,9 @@
                 updateStatus('Downloading data...', 'connected');
                 console.log("Recording stopped, starting data download...");
                 await downloadData();
+                
+                saveCurrentSession();
+                
                 document.getElementById('startButton').disabled = false;
                 document.getElementById('stopButton').disabled = true;
             } catch (error) {
@@ -297,30 +519,236 @@
             }
         }
 
-        function plotGraph() {
-            const trace = {
-                x: graphData.map(point => point.x),
-                y: graphData.map(point => point.y),
-                mode: 'lines',
-                type: 'scatter'
-            };
-            Plotly.newPlot('graph', [trace], graphLayout);
+        function saveCurrentSession() {
+            if (graphData.length > 0) {
+                const sessionDate = new Date().toLocaleString();
+                sessions.push({
+                    id: Date.now(),
+                    name: `Session ${sessions.length + 1}`,
+                    timestamp: sessionDate,
+                    data: [...graphData]
+                });
+                
+                updateSessionsList();
+                
+                console.log(`Session saved: ${sessions.length} total sessions`);
+            }
         }
 
-        function exportGraph() {
-            Plotly.toImage(document.getElementById('graph'), { format: 'png' }).then(url => {
-                const link = document.createElement('a');
-                link.href = url;
-                link.download = 'graph.png';
-                link.click();
+        function updateSessionsList() {
+            const sessionsListEl = document.getElementById('sessions-list');
+            sessionsListEl.innerHTML = '';
+            
+            if (sessions.length === 0) {
+                sessionsListEl.innerHTML = '<p>No saved sessions</p>';
+                return;
+            }
+            
+            sessions.forEach((session, index) => {
+                const sessionEl = document.createElement('div');
+                sessionEl.className = 'session-item';
+                
+                // Create session header with metadata
+                const headerEl = document.createElement('div');
+                headerEl.className = 'session-header';
+                
+                const colorIndicator = document.createElement('span');
+                colorIndicator.className = 'color-indicator';
+                colorIndicator.style.backgroundColor = getSessionColor(index);
+                
+                const nameEl = document.createElement('div');
+                nameEl.className = 'session-name';
+                
+                const nameText = document.createElement('span');
+                nameText.textContent = `${session.name} (${session.timestamp})`;
+                nameEl.appendChild(colorIndicator);
+                nameEl.appendChild(nameText);
+                
+                const actionsEl = document.createElement('div');
+                actionsEl.className = 'session-actions';
+                
+                const deleteBtn = document.createElement('button');
+                deleteBtn.textContent = 'Delete';
+                deleteBtn.className = 'session-delete-btn';
+                deleteBtn.onclick = () => deleteSession(index);
+                
+                actionsEl.appendChild(deleteBtn);
+                
+                headerEl.appendChild(nameEl);
+                headerEl.appendChild(actionsEl);
+                
+                // Create graph container for this session
+                const graphEl = document.createElement('div');
+                graphEl.className = 'session-graph';
+                graphEl.id = `session-graph-${session.id}`;
+                
+                // Add elements to session item
+                sessionEl.appendChild(headerEl);
+                sessionEl.appendChild(graphEl);
+                
+                // Add to sessions list
+                sessionsListEl.appendChild(sessionEl);
+                
+                // Plot the individual session graph
+                plotSessionGraph(session, index);
             });
         }
+
+        function plotSessionGraph(session, index) {
+            const trace = {
+                x: session.data.map(point => point.x),
+                y: session.data.map(point => point.y),
+                mode: 'lines',
+                type: 'scatter',
+                name: session.name,
+                line: { 
+                    color: getSessionColor(index),
+                    width: 2 
+                }
+            };
+            
+            const layout = {
+                title: session.name,
+                xaxis: { title: 'Time (s)' },
+                yaxis: { title: 'Velocity (m/s)' },
+                margin: { l: 50, r: 25, b: 50, t: 40, pad: 4 },
+                height: 260,
+                showlegend: false
+            };
+            
+            Plotly.newPlot(`session-graph-${session.id}`, [trace], layout, {responsive: true});
+        }
+
+        function plotGraph() {
+            // Plot only the current recording in the main graph
+            if (graphData.length > 0) {
+                const trace = {
+                    x: graphData.map(point => point.x),
+                    y: graphData.map(point => point.y),
+                    mode: 'lines',
+                    type: 'scatter',
+                    name: 'Current Recording',
+                    line: { 
+                        color: '#000000',
+                        width: 3
+                    }
+                };
+                
+                Plotly.newPlot('graph', [trace], {
+                    title: 'Current Recording',
+                    xaxis: { title: 'Time (s)' },
+                    yaxis: { title: 'Velocity (m/s)' },
+                    showlegend: false
+                });
+            } else {
+                // Empty graph when no current recording
+                Plotly.newPlot('graph', [{
+                    x: [],
+                    y: [],
+                    type: 'scatter'
+                }], {
+                    title: 'Current Recording',
+                    xaxis: { title: 'Time (s)' },
+                    yaxis: { title: 'Velocity (m/s)' },
+                    showlegend: false
+                });
+            }
+        }
+
+        function deleteSession(index) {
+            sessions.splice(index, 1);
+            updateSessionsList();
+        }
+
+        // Update exportGraph to export current graph and all session graphs
+        function exportGraph() {
+            // First export the current graph
+            Plotly.toImage(document.getElementById('graph'), { format: 'png', width: 1200, height: 600 }).then(url => {
+                const link = document.createElement('a');
+                link.href = url;
+                link.download = 'current_recording.png';
+                link.click();
+            });
+            
+            // Then export each session graph if any exist
+            if (sessions.length > 0) {
+                sessions.forEach((session, index) => {
+                    const graphId = `session-graph-${session.id}`;
+                    const graphElement = document.getElementById(graphId);
+                    
+                    if (graphElement) {
+                        Plotly.toImage(graphElement, { format: 'png', width: 1200, height: 400 }).then(url => {
+                            const link = document.createElement('a');
+                            link.href = url;
+                            link.download = `session_${index + 1}.png`;
+                            link.click();
+                        });
+                    }
+                });
+            }
+        }
+
+        function getSessionColor(index) {
+            const colors = [
+                '#FF5733', '#33FF57', '#3357FF', '#F033FF', '#FF33A8', 
+                '#33FFF6', '#F6FF33', '#FF8C33', '#8C33FF', '#33FFBD'
+            ];
+            return colors[index % colors.length];
+        }
+
+        document.getElementById('clearSessionsButton').addEventListener('click', function() {
+            if (confirm("Are you sure you want to delete all saved sessions?")) {
+                sessions = [];
+                updateSessionsList();
+                plotGraph();
+            }
+        });
 
         function handleDisconnect() {
             updateStatus('Disconnected', 'disconnected');
             document.getElementById('startButton').disabled = true;
             document.getElementById('stopButton').disabled = true;
+            document.getElementById('exportButton').disabled = true;
+            
+            if (reconnectTimer) {
+                clearTimeout(reconnectTimer);
+                reconnectTimer = null;
+            }
+            
+            if (document.getElementById('autoReconnect').checked && manuallyConnected) {
+                reconnectAttempts++;
+                const delay = Math.min(1000 * Math.min(reconnectAttempts, 5), 5000);
+                
+                updateStatus(`Reconnecting in ${delay/1000}s...`, 'disconnected');
+                console.log(`Will attempt to reconnect in ${delay/1000} seconds (attempt ${reconnectAttempts})`);
+                
+                reconnectTimer = setTimeout(async () => {
+                    updateStatus('Reconnecting...', 'disconnected');
+                    
+                    try {
+                        console.log(`Attempting to reconnect... (attempt ${reconnectAttempts})`);
+                        if (device) {
+                            const success = await connectToDeviceById(device);
+                            if (!success) {
+                                handleDisconnect();
+                            }
+                        }
+                    } catch (error) {
+                        console.error("Reconnection attempt failed:", error);
+                        handleDisconnect();
+                    }
+                }, delay);
+            } else {
+                const reason = !document.getElementById('autoReconnect').checked ? 
+                    "auto-reconnect is disabled" : "no manual connection was made in this session";
+                console.log(`Not attempting to reconnect because ${reason}`);
+            }
         }
+
+        window.addEventListener('beforeunload', function() {
+            manuallyConnected = false;
+            sessionStorage.removeItem('browserSessionActive');
+        });
 
         function updateStatus(message, className) {
             const statusDiv = document.getElementById('status');

@@ -9,8 +9,7 @@
 #define CMD_START 0x01
 #define CMD_STOP 0x02
 #define CMD_DOWNLOAD 0x03
-
-#define PIN_VBAT A0                         // Analog pin connected to battery
+// Analog pin connected to battery
 #define VBAT_MV_PER_LSB (3600.0F / 1023.0F) // 3.6V reference voltage
 #define VBAT_DIVIDER 2.0F                   // Voltage divider on the board
 #define VBAT_OFFSET 0.1F                    // Compensation for voltage drop
@@ -28,6 +27,13 @@ DataPoint dataBuffer[MAX_DATA_POINTS];
 int dataIndex = 0;
 bool isRecording = false;
 
+// Advertising parameters
+#define ADVERTISING_INTERVAL_MS 100 // Fast advertising interval (100ms)
+#define ADVERTISING_TIMEOUT_MS 0    // No timeout (continuous advertising)
+#define ADVERTISING_POWER 4         // Default tx power (values from -40 to +8)
+#define CONN_INTERVAL_MIN 8         // Minimum acceptable connection interval (10ms)
+#define CONN_INTERVAL_MAX 16        // Maximum acceptable connection interval (20ms)
+
 BLEService imuService(ACC_SERVICE_UUID);
 BLECharacteristic cmdCharacteristic(CMD_CHARACTERISTIC_UUID, BLEWrite | BLERead, 5);
 BLECharacteristic dataCharacteristic(DATA_CHARACTERISTIC_UUID, BLERead, sizeof(DataPoint));
@@ -36,7 +42,8 @@ BLECharacteristic dataCharacteristic(DATA_CHARACTERISTIC_UUID, BLERead, sizeof(D
 BLEService batteryService(0x180F);                                        // Battery service UUID
 BLECharacteristic batteryLevelChar(0x2A19, BLERead | BLENotify, 1, true); // Battery level characteristic
 
-bool isConnected = false; // Track connection status
+bool isConnected = false;        // Track connection status status
+bool restartAdvertising = false; // Flag to restart advertising after disconnect
 
 // Variables for orientation and velocity calculation
 float roll = 0.0, pitch = 0.0, yaw = 0.0;
@@ -49,9 +56,10 @@ const float velocityDecayFactor = 0.95; // Faster decay for a 70kg individual
 const float alpha = 0.98; // Weight for gyroscope data
 
 // Constants for improved velocity calculation
-#define ACCEL_THRESHOLD 0.05     // Threshold to detect movement
-#define STILLNESS_DURATION 200   // Time in ms to recognize stillness
-#define VELOCITY_HISTORY_SIZE 10 // Size of the velocity smoothing buffer
+#define ACCEL_THRESHOLD 0.05       // Threshold to detect movement
+#define STILLNESS_DURATION 200     // Time in ms to recognize stillness
+#define VELOCITY_HISTORY_SIZE 10   // Size of the velocity smoothing buffer
+#define DEFAULT_STRIDE_LENGTH 0.75 // Default stride length in meters
 
 // Variables for improved velocity calculation
 float velocityHistory[VELOCITY_HISTORY_SIZE] = {0};
@@ -60,6 +68,7 @@ bool wasStill = true;
 unsigned long stillStartTime = 0;
 float peakAcceleration = 0;
 float strideFrequency = 0;
+float strideLength = DEFAULT_STRIDE_LENGTH; // Define stride length variable
 unsigned long lastPeakTime = 0;
 unsigned long lastZeroVelocityUpdate = 0;
 
@@ -78,6 +87,12 @@ void setup()
   Serial.println("Initializing BLE...");
   Bluefruit.begin();
   Bluefruit.setName("IMU");
+  Bluefruit.setTxPower(ADVERTISING_POWER);
+
+  // Set connection interval (how often BLE sends packets)
+  // Important for reliable connection and reconnection
+  Bluefruit.Periph.setConnInterval(CONN_INTERVAL_MIN, CONN_INTERVAL_MAX);
+
   imuService.begin();
   cmdCharacteristic.begin();
   cmdCharacteristic.setWriteCallback(commandCallback);
@@ -98,13 +113,33 @@ void setup()
   Bluefruit.Periph.setConnectCallback(onConnect);
   Bluefruit.Periph.setDisconnectCallback(onDisconnect);
 
+  // Configure advertising
   Bluefruit.Advertising.addService(imuService);
+
+  // More comprehensive advertising setup for better reconnection
+  Bluefruit.Advertising.addFlags(BLE_GAP_ADV_FLAGS_LE_ONLY_GENERAL_DISC_MODE);
+  Bluefruit.Advertising.addTxPower();
+  Bluefruit.Advertising.addName();
+
+  // Set advertising parameters for better discoveryng
+  Bluefruit.Advertising.restartOnDisconnect(true);                                         // No timeout for fast advertising
+  Bluefruit.Advertising.setInterval(ADVERTISING_INTERVAL_MS, ADVERTISING_INTERVAL_MS * 2); // Fast advertisingimeout (continuous advertising)
+  Bluefruit.Advertising.setFastTimeout(0);                                                 // No timeout for fast advertising
+
   Bluefruit.Advertising.start();
   Serial.println("BLE initialized and advertising started");
 }
 
 void loop()
 {
+  // Check if we need to restart advertising (after disconnection)
+  if (restartAdvertising && !Bluefruit.Advertising.isRunning())
+  {
+    Serial.println("Restarting advertising to improve reconnection...");
+    Bluefruit.Advertising.start();
+    restartAdvertising = false;
+  }
+
   if (isRecording)
   {
     if (dataIndex < MAX_DATA_POINTS)
@@ -258,6 +293,13 @@ void loop()
     Serial.print(batteryLevel);
     Serial.println("%");
     lastBatteryUpdate = millis();
+
+    // Make sure advertising is running for reconnection
+    if (!isConnected && !Bluefruit.Advertising.isRunning())
+    {
+      Serial.println("Restarting advertising during battery update...");
+      Bluefruit.Advertising.start();
+    }
   }
 
   // If disconnected and buffer is full, wait for reconnection to upload data
@@ -400,7 +442,18 @@ void onConnect(uint16_t conn_handle)
 void onDisconnect(uint16_t conn_handle, uint8_t reason)
 {
   isConnected = false;
-  Serial.println("Device disconnected");
+  Serial.print("Device disconnected. Reason: 0x");
+  Serial.println(reason, HEX);
+
+  // Set flag to restart advertising in the main loop
+  restartAdvertising = true;
+
+  // Start fast advertising immediately to improve reconnection
+  if (!Bluefruit.Advertising.isRunning())
+  {
+    Serial.println("Restarting advertising after disconnect...");
+    Bluefruit.Advertising.start();
+  }
 }
 
 uint8_t getBatteryLevel()
